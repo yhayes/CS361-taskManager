@@ -3,6 +3,9 @@ This is where all the core task management business logic lives.
 Handles add, view, and delete operations with validation.
 """
 
+import zmq
+import json
+
 from storage import load_tasks, save_tasks
 from ui import (
     display_add_task_header,
@@ -19,6 +22,119 @@ from ui import (
 )
 
 
+def format_text_via_service(text, format_type="sentence"):
+    """
+    Format text using the Text Formatter microservice.
+
+    Args:
+        text: The text to format
+        format_type: Type of formatting ("sentence", "upper", "lower", "title")
+
+    Returns:
+        Formatted text, or original text if service unavailable
+    """
+    try:
+        # Create ZeroMQ context and socket
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.connect("tcp://localhost:5555")
+
+        # Set timeout to avoid hanging if service is down
+        socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2 second timeout
+
+        # Prepare request
+        request = {
+            "text": text,
+            "format_type": format_type
+        }
+
+        # Send request
+        socket.send_string(json.dumps(request))
+
+        # Receive response
+        response_json = socket.recv_string()
+        response = json.loads(response_json)
+
+        # Clean up
+        socket.close()
+        context.term()
+
+        # Return formatted text or handle error
+        if response.get("error"):
+            print(f"\n[Warning] Text Formatter error: {response['error']}")
+            return text  # Return original text if error
+
+        return response.get("formatted_text", text)
+
+    except zmq.error.Again:
+        # Timeout - service not running
+        print("\n[Warning] Text Formatter service not responding. Using original text.")
+        return text
+    except Exception as e:
+        # Any other error
+        print(f"\n[Warning] Could not connect to Text Formatter: {str(e)}")
+        return text
+
+
+def validate_text_via_service(text, min_length=1, max_length=100):
+    """
+    Validate text using the Text Validator microservice.
+
+    Args:
+        text: The text to validate
+        min_length: Minimum required length (default: 1)
+        max_length: Maximum allowed length (default: 100)
+
+    Returns:
+        Tuple of (is_valid: bool, error_message: str or None)
+    """
+    try:
+        # Create ZeroMQ context and socket
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.connect("tcp://localhost:5556")
+
+        # Set timeout to avoid hanging if service is down
+        socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2 second timeout
+
+        # Prepare request
+        request = {
+            "text": text,
+            "min_length": min_length,
+            "max_length": max_length
+        }
+
+        # Send request
+        socket.send_string(json.dumps(request))
+
+        # Receive response
+        response_json = socket.recv_string()
+        response = json.loads(response_json)
+
+        # Clean up
+        socket.close()
+        context.term()
+
+        # Return validation result
+        is_valid = response.get("valid", False)
+        error_message = response.get("error", None)
+
+        return is_valid, error_message
+
+    except zmq.error.Again:
+        # Timeout - service not running, do basic validation
+        print("\n[Warning] Text Validator service not responding. Using basic validation.")
+        if not text or text.strip() == "":
+            return False, "Text cannot be empty"
+        return True, None
+    except Exception as e:
+        # Any other error - do basic validation
+        print(f"\n[Warning] Could not connect to Text Validator: {str(e)}")
+        if not text or text.strip() == "":
+            return False, "Text cannot be empty"
+        return True, None
+
+
 def add_task():
     """
     Add a new task to the task list.
@@ -30,14 +146,31 @@ def add_task():
     # Get task title
     title = get_task_title()
 
-    # Validate title is not empty
-    if not title or title.strip() == "":
-        display_error_message("Task title cannot be empty")
+    # Validate title using Text Validator microservice
+    is_valid, error_message = validate_text_via_service(title, min_length=1, max_length=100)
+    if not is_valid:
+        display_error_message(error_message)
         wait_for_return_to_menu()
         return
 
+    # Format title using Text Formatter microservice
+    # Use "title" format to capitalize first letter of each word
+    title = format_text_via_service(title, "title")
+
     # Get task description
     description = get_task_description()
+
+    # Validate description using Text Validator microservice
+    # Description is optional, so min_length=0
+    is_valid, error_message = validate_text_via_service(description, min_length=0, max_length=500)
+    if not is_valid:
+        display_error_message(error_message)
+        wait_for_return_to_menu()
+        return
+
+    # Format description using Text Formatter microservice
+    # Use "sentence" format for proper sentence capitalization
+    description = format_text_via_service(description, "sentence")
 
     # Create task dictionary
     task = {
